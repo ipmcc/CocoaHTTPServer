@@ -71,9 +71,11 @@
 			_logsDirectory = [aLogsDirectory copy];
 		else
 			_logsDirectory = [[self defaultLogsDirectory] copy];
-		
-		NSKeyValueObservingOptions kvoOptions = NSKeyValueObservingOptionOld | NSKeyValueObservingOptionNew;
-		
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wassign-enum"
+        NSKeyValueObservingOptions kvoOptions = NSKeyValueObservingOptionOld | NSKeyValueObservingOptionNew;
+#pragma clang diagnostic pop
+        
 		[self addObserver:self forKeyPath:@"maximumNumberOfLogFiles" options:kvoOptions context:nil];
 		
 		NSLogVerbose(@"DDFileLogManagerDefault: logsDirectory:\n%@", [self logsDirectory]);

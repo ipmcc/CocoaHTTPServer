@@ -178,16 +178,19 @@ enum GCDAsyncSocketConfig
   static NSThread *cfstreamThread;  // Used for CFStreams
 #endif
 
-@interface GCDAsyncSocket ()
+@interface GCDAsyncSocket () <GCDAsyncSocketBoundSocketProvider>
 {
 	uint32_t flags;
 	uint16_t config;
 	
 #if __has_feature(objc_arc_weak)
-	__weak id delegate;
+    __weak id delegate;
+    __weak id boundSocketProvider;
 #else
-	__unsafe_unretained id delegate;
+    __unsafe_unretained id delegate;
+    __unsafe_unretained id boundSocketProvider;
 #endif
+    
 	dispatch_queue_t delegateQueue;
 	
 	int socket4FD;
@@ -1449,6 +1452,114 @@ enum GCDAsyncSocketConfig
 #pragma mark Accepting
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+- (id)boundSocketProvider
+{
+    if (dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey))
+    {
+        return boundSocketProvider;
+    }
+    else
+    {
+        __block id result;
+        
+        dispatch_sync(socketQueue, ^{
+            result = boundSocketProvider;
+        });
+        
+        return result;
+    }
+}
+
+- (void)setBoundSocketProvider:(id)provider synchronously:(BOOL)synchronously
+{
+    dispatch_block_t block = ^{
+        boundSocketProvider = provider;
+    };
+    
+    if (dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey)) {
+        block();
+    }
+    else {
+        if (synchronously)
+            dispatch_sync(socketQueue, block);
+        else
+            dispatch_async(socketQueue, block);
+    }
+}
+
+- (void)setBoundSocketProvider:(id)provider
+{
+    [self setBoundSocketProvider:provider synchronously:NO];
+}
+
+- (int)asyncSocket: (GCDAsyncSocket*)sock bindSocketForDomain: (int)domain onInterfaceAddress: (NSData*)interfaceAddr error: (NSError**)outErr
+{
+    int socketFD = socket(domain, SOCK_STREAM, 0);
+    
+    if (socketFD == SOCKET_NULL)
+    {
+        NSString *reason = @"Error in socket() function";
+        if (outErr) *outErr = [self errnoErrorWithReason:reason];
+        
+        return SOCKET_NULL;
+    }
+    
+    int status;
+    
+    // Set socket options
+    
+    status = fcntl(socketFD, F_SETFL, O_NONBLOCK);
+    if (status == -1)
+    {
+        NSString *reason = @"Error enabling non-blocking IO on socket (fcntl)";
+        if (outErr) *outErr = [self errnoErrorWithReason:reason];
+        
+        LogVerbose(@"close(socketFD)");
+        close(socketFD);
+        return SOCKET_NULL;
+    }
+    
+    int reuseOn = 1;
+    status = setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuseOn, sizeof(reuseOn));
+    if (status == -1)
+    {
+        NSString *reason = @"Error enabling address reuse (setsockopt)";
+        if (outErr) *outErr = [self errnoErrorWithReason:reason];
+        
+        LogVerbose(@"close(socketFD)");
+        close(socketFD);
+        return SOCKET_NULL;
+    }
+    
+    // Bind socket
+    
+    status = bind(socketFD, (const struct sockaddr *)[interfaceAddr bytes], (socklen_t)[interfaceAddr length]);
+    if (status == -1)
+    {
+        NSString *reason = @"Error in bind() function";
+        if (outErr) *outErr = [self errnoErrorWithReason:reason];
+        
+        LogVerbose(@"close(socketFD)");
+        close(socketFD);
+        return SOCKET_NULL;
+    }
+    
+    // Listen
+    
+    status = listen(socketFD, 1024);
+    if (status == -1)
+    {
+        NSString *reason = @"Error in listen() function";
+        if (outErr) *outErr = [self errnoErrorWithReason:reason];
+        
+        LogVerbose(@"close(socketFD)");
+        close(socketFD);
+        return SOCKET_NULL;
+    }
+    
+    return socketFD;
+}
+
 - (BOOL)acceptOnPort:(uint16_t)port error:(NSError **)errPtr
 {
 	return [self acceptOnInterface:nil port:port error:errPtr];
@@ -1463,78 +1574,7 @@ enum GCDAsyncSocketConfig
 	
 	__block BOOL result = NO;
 	__block NSError *err = nil;
-	
-	// CreateSocket Block
-	// This block will be invoked within the dispatch block below.
-	
-	int(^createSocket)(int, NSData*) = ^int (int domain, NSData *interfaceAddr) {
 		
-		int socketFD = socket(domain, SOCK_STREAM, 0);
-		
-		if (socketFD == SOCKET_NULL)
-		{
-			NSString *reason = @"Error in socket() function";
-			err = [self errnoErrorWithReason:reason];
-			
-			return SOCKET_NULL;
-		}
-		
-		int status;
-		
-		// Set socket options
-		
-		status = fcntl(socketFD, F_SETFL, O_NONBLOCK);
-		if (status == -1)
-		{
-			NSString *reason = @"Error enabling non-blocking IO on socket (fcntl)";
-			err = [self errnoErrorWithReason:reason];
-			
-			LogVerbose(@"close(socketFD)");
-			close(socketFD);
-			return SOCKET_NULL;
-		}
-		
-		int reuseOn = 1;
-		status = setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuseOn, sizeof(reuseOn));
-		if (status == -1)
-		{
-			NSString *reason = @"Error enabling address reuse (setsockopt)";
-			err = [self errnoErrorWithReason:reason];
-			
-			LogVerbose(@"close(socketFD)");
-			close(socketFD);
-			return SOCKET_NULL;
-		}
-		
-		// Bind socket
-		
-		status = bind(socketFD, (const struct sockaddr *)[interfaceAddr bytes], (socklen_t)[interfaceAddr length]);
-		if (status == -1)
-		{
-			NSString *reason = @"Error in bind() function";
-			err = [self errnoErrorWithReason:reason];
-			
-			LogVerbose(@"close(socketFD)");
-			close(socketFD);
-			return SOCKET_NULL;
-		}
-		
-		// Listen
-		
-		status = listen(socketFD, 1024);
-		if (status == -1)
-		{
-			NSString *reason = @"Error in listen() function";
-			err = [self errnoErrorWithReason:reason];
-			
-			LogVerbose(@"close(socketFD)");
-			close(socketFD);
-			return SOCKET_NULL;
-		}
-		
-		return socketFD;
-	};
-	
 	// Create dispatch block and run on socketQueue
 	
 	dispatch_block_t block = ^{ @autoreleasepool {
@@ -1554,6 +1594,8 @@ enum GCDAsyncSocketConfig
 			
 			return_from_block;
 		}
+        
+        id<GCDAsyncSocketBoundSocketProvider> provider = self.boundSocketProvider ?: self;
 		
 		BOOL isIPv4Disabled = (config & kIPv4Disabled) ? YES : NO;
 		BOOL isIPv6Disabled = (config & kIPv6Disabled) ? YES : NO;
@@ -1617,7 +1659,7 @@ enum GCDAsyncSocketConfig
 		if (enableIPv4)
 		{
 			LogVerbose(@"Creating IPv4 socket");
-			socket4FD = createSocket(AF_INET, interface4);
+            socket4FD = [provider asyncSocket: self bindSocketForDomain: AF_INET onInterfaceAddress: interface4 error: &err];
 			
 			if (socket4FD == SOCKET_NULL)
 			{
@@ -1637,8 +1679,8 @@ enum GCDAsyncSocketConfig
 				struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)[interface6 mutableBytes];
 				addr6->sin6_port = htons([self localPort4]);
 			}
-			
-			socket6FD = createSocket(AF_INET6, interface6);
+            
+            socket6FD = [provider asyncSocket: self bindSocketForDomain: AF_INET6 onInterfaceAddress: interface6 error: &err];
 			
 			if (socket6FD == SOCKET_NULL)
 			{

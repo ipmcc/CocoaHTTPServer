@@ -338,6 +338,9 @@
 	SecKeychainCopyDefault(&keychain);
 	
 	OSStatus err = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    
 	err = SecKeychainItemImport((__bridge CFDataRef)certData,  // CFDataRef importedData
 								NULL,                          // CFStringRef fileNameOrExtension
 								&inputFormat,                  // SecExternalFormat *inputFormat
@@ -346,7 +349,8 @@
 								&importParameters,             // const SecKeyImportExportParameters *keyParams
 								keychain,                      // SecKeychainRef importKeychain
 								&outItems);                    // CFArrayRef *outItems
-	
+#pragma clang diagnostic pop
+    
 	NSLog(@"OSStatus: %i", err);
 	
 	NSLog(@"SecExternalFormat: %@", [DDKeychain stringForSecExternalFormat:inputFormat]);
@@ -416,7 +420,9 @@
 	**/
 	
 	SecKeychainCopyDefault(&keychain);
-	
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    
 	SecIdentitySearchCreate(keychain, CSSM_KEYUSE_ANY, &searchRef);
 	
 	SecIdentityRef currentIdentityRef = NULL;
@@ -474,7 +480,8 @@
 		
 		CFRelease(currentIdentityRef);
 	}
-	
+#pragma clang diagnostic pop
+    
 	if(keychain)  CFRelease(keychain);
 	if(searchRef) CFRelease(searchRef);
 	

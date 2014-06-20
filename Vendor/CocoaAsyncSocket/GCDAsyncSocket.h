@@ -130,6 +130,12 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 - (void)setDelegate:(id)delegate delegateQueue:(dispatch_queue_t)delegateQueue;
 - (void)synchronouslySetDelegate:(id)delegate delegateQueue:(dispatch_queue_t)delegateQueue;
 
+#pragma mark Socket Binder
+
+- (id)boundSocketProvider;
+- (void)setBoundSocketProvider: (id)proivder;
+
+
 /**
  * By default, both IPv4 and IPv6 are enabled.
  * 
@@ -1072,3 +1078,11 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 - (void)socketDidSecure:(GCDAsyncSocket *)sock;
 
 @end
+
+// This allows you to provide a different implementation for binding the listening sockets. (i.e. a privileged helper)
+@protocol GCDAsyncSocketBoundSocketProvider <NSObject>
+
+- (int)asyncSocket: (GCDAsyncSocket*)sock bindSocketForDomain: (int)domain onInterfaceAddress: (NSData*)interfaceAddr error: (NSError**)outErr;
+
+@end
+

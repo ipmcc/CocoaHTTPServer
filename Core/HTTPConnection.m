@@ -895,10 +895,13 @@ static NSMutableArray *recentNonces;
 	
 	if (HTTP_LOG_VERBOSE)
 	{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"        
 		NSData *tempData = [request messageData];
 		
 		NSString *tempStr = [[NSString alloc] initWithData:tempData encoding:NSUTF8StringEncoding];
 		HTTPLogVerbose(@"%@[%p]: Received HTTP request:\n%@", THIS_FILE, self, tempStr);
+#pragma clang diagnostic pop
 	}
 	
 	// Check the HTTP version
