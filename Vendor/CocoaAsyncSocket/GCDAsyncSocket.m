@@ -1049,6 +1049,11 @@ enum GCDAsyncSocketConfig
 
 - (id)initWithDelegate:(id)aDelegate delegateQueue:(dispatch_queue_t)dq socketQueue:(dispatch_queue_t)sq
 {
+    return [self initWithDelegate:aDelegate delegateQueue:dq socketQueue:NULL fd4: SOCKET_NULL fd6: SOCKET_NULL flags: 0];
+}
+
+- (id)initWithDelegate:(id)aDelegate delegateQueue:(dispatch_queue_t)dq socketQueue:(dispatch_queue_t)sq fd4: (int)fd4 fd6: (int)fd6 flags: (uint32_t)inFlags
+{
 	if((self = [super init]))
 	{
 		delegate = aDelegate;
@@ -1058,8 +1063,9 @@ enum GCDAsyncSocketConfig
 		if (dq) dispatch_retain(dq);
 		#endif
 		
-		socket4FD = SOCKET_NULL;
-		socket6FD = SOCKET_NULL;
+		socket4FD = fd4;
+		socket6FD = fd6;
+        flags = inFlags;
 		connectIndex = 0;
 		
 		if (sq)
@@ -1110,6 +1116,19 @@ enum GCDAsyncSocketConfig
 		currentWrite = nil;
 		
 		preBuffer = [[GCDAsyncSocketPreBuffer alloc] initWithCapacity:(1024 * 4)];
+        
+        dispatch_sync(socketQueue, ^{ @autoreleasepool {
+            if (fd4 != SOCKET_NULL)
+            {
+                [self setupReadAndWriteSourcesForNewlyConnectedSocket: fd4];
+            }
+            
+            if (fd6 != SOCKET_NULL)
+            {
+                [self setupReadAndWriteSourcesForNewlyConnectedSocket: fd6];
+            }
+        }});
+        
 	}
 	return self;
 }

@@ -2,6 +2,7 @@
 
 @class GCDAsyncSocket;
 @class WebSocket;
+@protocol HTTPConnection;
 
 #if TARGET_OS_IPHONE
   #if __IPHONE_OS_VERSION_MIN_REQUIRED >= 40000 // iPhone 4.0
@@ -198,6 +199,9 @@
 - (BOOL)isRunning;
 
 - (void)addWebSocket:(WebSocket *)ws;
+
+- (void)addConnection: (id<HTTPConnection>)connection;
+
 
 - (NSUInteger)numberOfHTTPConnections;
 - (NSUInteger)numberOfWebSocketConnections;

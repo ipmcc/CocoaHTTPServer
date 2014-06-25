@@ -452,7 +452,7 @@ static const int httpLogLevel = HTTP_LOG_LEVEL_INFO; // | HTTP_LOG_FLAG_TRACE;
 		{
 			// Stop all HTTP connections the server owns
 			[connectionsLock lock];
-			for (HTTPConnection *connection in connections)
+			for (id<HTTPConnection> connection in connections)
 			{
 				[connection stop];
 			}
@@ -544,14 +544,19 @@ static const int httpLogLevel = HTTP_LOG_LEVEL_INFO; // | HTTP_LOG_FLAG_TRACE;
 	return [[HTTPConfig alloc] initWithServer:self documentRoot:documentRoot queue:connectionQueue];
 }
 
+- (void)addConnection: (id<HTTPConnection>)connection
+{
+    [connectionsLock lock];
+    [connections addObject: connection];
+    [connectionsLock unlock];
+}
+
 - (void)socket:(GCDAsyncSocket *)sock didAcceptNewSocket:(GCDAsyncSocket *)newSocket
 {
-	HTTPConnection *newConnection = (HTTPConnection *)[[connectionClass alloc] initWithAsyncSocket:newSocket
-	                                                                                 configuration:[self config]];
-	[connectionsLock lock];
-	[connections addObject:newConnection];
-	[connectionsLock unlock];
-	
+    id<HTTPConnection> newConnection = (id<HTTPConnection>)[[connectionClass alloc] initWithAsyncSocket:newSocket
+                                                                                           configuration:[self config]];
+    [self addConnection: newConnection];
+    
 	[newConnection start];
 }
 

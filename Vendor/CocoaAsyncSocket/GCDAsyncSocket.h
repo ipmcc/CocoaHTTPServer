@@ -115,6 +115,7 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 - (id)initWithSocketQueue:(dispatch_queue_t)sq;
 - (id)initWithDelegate:(id)aDelegate delegateQueue:(dispatch_queue_t)dq;
 - (id)initWithDelegate:(id)aDelegate delegateQueue:(dispatch_queue_t)dq socketQueue:(dispatch_queue_t)sq;
+- (id)initWithDelegate:(id)aDelegate delegateQueue:(dispatch_queue_t)dq socketQueue:(dispatch_queue_t)sq fd4: (int)fd4 fd6: (int)fd6 flags: (uint32_t)inFlags;
 
 #pragma mark Configuration
 
@@ -133,8 +134,7 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 #pragma mark Socket Binder
 
 - (id)boundSocketProvider;
-- (void)setBoundSocketProvider: (id)proivder;
-
+- (void)setBoundSocketProvider: (id)provider;
 
 /**
  * By default, both IPv4 and IPv6 are enabled.

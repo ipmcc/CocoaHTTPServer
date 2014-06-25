@@ -6,6 +6,12 @@
 @class WebSocket;
 @protocol HTTPResponse;
 
+@protocol HTTPConnection <NSObject>
+
+- (void)start;
+- (void)stop;
+
+@end
 
 #define HTTPConnectionDidDieNotification  @"HTTPConnectionDidDie"
 
@@ -33,7 +39,7 @@
 #pragma mark -
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-@interface HTTPConnection : NSObject
+@interface HTTPConnection : NSObject <HTTPConnection>
 {
 	dispatch_queue_t connectionQueue;
 	GCDAsyncSocket *asyncSocket;
