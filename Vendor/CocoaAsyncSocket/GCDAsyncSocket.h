@@ -130,6 +130,9 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 - (void)setDelegate:(id)delegate delegateQueue:(dispatch_queue_t)delegateQueue;
 - (void)synchronouslySetDelegate:(id)delegate delegateQueue:(dispatch_queue_t)delegateQueue;
 
+- (void)setupReadAndWriteSourcesForNewlyConnectedSocket;
+
+
 /**
  * By default, both IPv4 and IPv6 are enabled.
  * 
@@ -1074,5 +1077,7 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
  * and the socketDidDisconnect:withError: delegate method will be called with the specific SSL error code.
 **/
 - (void)socketDidSecure:(GCDAsyncSocket *)sock;
+
+- (BOOL)socketShouldSetupSourcesForAcceptedSocket: (GCDAsyncSocket*)sock;
 
 @end

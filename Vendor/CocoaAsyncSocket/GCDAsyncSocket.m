@@ -1192,12 +1192,14 @@ enum GCDAsyncSocketConfig
         
         config = (uint16_t)[aDecoder decodeInt32ForKey: @"config"];
         
+        // We have to dup() here because NSFileHandles deserialized from XPC connections are created with ownership
+        // (i.e. closeOnDealloc: YES) and when we return from this method, they'll be closed.
+        
         NSFileHandle* fh4 = [aDecoder decodeObjectOfClass: [NSFileHandle class] forKey: @"socket4FD"];
-        socket4FD = fh4 ? fh4.fileDescriptor : SOCKET_NULL;
+        socket4FD = fh4 ? dup(fh4.fileDescriptor) : SOCKET_NULL;
 
         NSFileHandle* fh6 = [aDecoder decodeObjectOfClass: [NSFileHandle class] forKey: @"socket6FD"];
-        socket6FD = fh6 ? fh6.fileDescriptor : SOCKET_NULL;
-        
+        socket6FD = fh6 ? dup(fh6.fileDescriptor) : SOCKET_NULL;
         
         connectInterface4 = [aDecoder decodeObjectOfClass: [NSData class] forKey: @"connectInterface4"];
         connectInterface6 = [aDecoder decodeObjectOfClass: [NSData class] forKey: @"connectInterface6"];
@@ -1958,12 +1960,21 @@ enum GCDAsyncSocketConfig
 			acceptedSocket->flags = (kSocketStarted | kConnected);
 			
 			// Setup read and write sources for accepted socket
-			
-			dispatch_async(acceptedSocket->socketQueue, ^{ @autoreleasepool {
-				
-				[acceptedSocket setupReadAndWriteSourcesForNewlyConnectedSocket:childSocketFD];
-			}});
-			
+            BOOL shouldSetupSources = YES;
+            
+            if ([theDelegate respondsToSelector: @selector(socketShouldSetupSourcesForAcceptedSocket:)])
+            {
+                shouldSetupSources = [theDelegate socketShouldSetupSourcesForAcceptedSocket: acceptedSocket];
+            }
+            
+            if (shouldSetupSources)
+            {
+                dispatch_async(acceptedSocket->socketQueue, ^{ @autoreleasepool {
+                    
+                    [acceptedSocket setupReadAndWriteSourcesForNewlyConnectedSocket:childSocketFD];
+                }});
+            }
+            
 			// Notify delegate
 			
 			if ([theDelegate respondsToSelector:@selector(socket:didAcceptNewSocket:)])
@@ -3762,6 +3773,30 @@ enum GCDAsyncSocketConfig
 	
 	if (interfaceAddr4Ptr) *interfaceAddr4Ptr = addr4;
 	if (interfaceAddr6Ptr) *interfaceAddr6Ptr = addr6;
+}
+
+- (void)setupReadAndWriteSourcesForNewlyConnectedSocket
+{
+    dispatch_block_t block = ^()
+    {
+        NSAssert(!readSource && !writeSource, @"Sources already set up");
+        
+        if (socket4FD != SOCKET_NULL)
+        {
+            [self setupReadAndWriteSourcesForNewlyConnectedSocket: socket4FD];
+        }
+        
+        if (socket6FD != SOCKET_NULL)
+        {
+            [self setupReadAndWriteSourcesForNewlyConnectedSocket: socket6FD];
+        }
+    };
+    
+    if (dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey))
+        block();
+    else
+        dispatch_sync(socketQueue, block);
+    
 }
 
 - (void)setupReadAndWriteSourcesForNewlyConnectedSocket:(int)socketFD
