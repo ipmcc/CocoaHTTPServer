@@ -172,6 +172,7 @@ enum GCDAsyncSocketConfig
 	kIPv6Disabled              = 1 << 1,  // If set, IPv6 is disabled
 	kPreferIPv6                = 1 << 2,  // If set, IPv6 is preferred over IPv4
 	kAllowHalfDuplexConnection = 1 << 3,  // If set, the socket will stay open even if the read stream closes
+    kDoNotCloseOnDealloc       = 1 << 4,  // if set, do not close sockets on dealloc
 };
 
 #if TARGET_OS_IPHONE
@@ -215,6 +216,7 @@ enum GCDAsyncSocketConfig
 	unsigned long socketFDBytesAvailable;
 	
 	GCDAsyncSocketPreBuffer *preBuffer;
+    
 		
 #if TARGET_OS_IPHONE
 	CFStreamClientContext streamContext;
@@ -247,7 +249,7 @@ enum GCDAsyncSocketConfig
 - (void)didNotConnect:(int)aConnectIndex error:(NSError *)error;
 
 // Disconnect
-- (void)closeWithError:(NSError *)error;
+- (void)closeForDealloc: (BOOL)forDealloc withError:(NSError *)error;
 - (void)maybeClose;
 
 // Errors
@@ -1117,12 +1119,12 @@ enum GCDAsyncSocketConfig
 	
 	if (dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey))
 	{
-		[self closeWithError:nil];
+		[self closeForDealloc: YES withError:nil];
 	}
 	else
 	{
 		dispatch_sync(socketQueue, ^{
-			[self closeWithError:nil];
+			[self closeForDealloc: YES withError:nil];
 		});
 	}
 	
@@ -1139,6 +1141,82 @@ enum GCDAsyncSocketConfig
 	socketQueue = NULL;
 	
 	LogInfo(@"%@ - %@ (finish)", THIS_METHOD, self);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Coding
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
++ (BOOL)supportsSecureCoding
+{
+    return YES;
+}
+
+- (void)encodeWithCoder:(NSCoder *)aCoder
+{
+    //NSAssert(flags & kSocketQueueIsPrivate, @"Can't serialize a socket with an exogenous queue; we'd have no way to preserve it on de-serialize");
+    NSAssert(!delegate && !delegateQueue, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(readQueue.count == 0, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(writeQueue.count == 0, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(!currentRead, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(!currentWrite, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(!preBuffer || 0 == preBuffer.availableBytes, @"Can't serialize a socket with a delegate. How would we hook it up later?");
+    NSAssert(!userData, @"blerg");
+    NSAssert(!accept4Source && !accept6Source && !readSource && !writeSource, @"derp");
+    
+    [aCoder encodeInt32:(int32_t)flags forKey: @"flags"];
+    [aCoder encodeInt32:(int32_t)config forKey: @"config"];
+    if (socket4FD != SOCKET_NULL)
+    {
+        [aCoder encodeObject: [[NSFileHandle alloc] initWithFileDescriptor: socket4FD closeOnDealloc: NO] forKey: @"socket4FD"];
+    }
+    if (socket6FD != SOCKET_NULL)
+    {
+        [aCoder encodeObject: [[NSFileHandle alloc] initWithFileDescriptor: socket6FD closeOnDealloc: NO] forKey: @"socket6FD"];
+    }
+    [aCoder encodeObject: connectInterface4 forKey: @"connectInterface4"];
+    [aCoder encodeObject: connectInterface6 forKey: @"connectInterface6"];
+    [aCoder encodeInteger: socketFDBytesAvailable forKey: @"socketFDBytesAvailable"];
+    
+    //config |= kDoNotCloseOnDealloc;
+}
+
+- (id)initWithCoder:(NSCoder *)aDecoder
+{
+    if (self = [super init])
+    {
+        flags = (uint32_t)[aDecoder decodeInt32ForKey: @"flags"];
+        //NSAssert(flags & kSocketQueueIsPrivate, @"Any socket we're deserializing should have had a private queue.");
+        
+        socketFDBytesAvailable = (unsigned long)[aDecoder decodeIntegerForKey: @"socketFDBytesAvailable"];
+        
+        config = (uint16_t)[aDecoder decodeInt32ForKey: @"config"];
+        
+        NSFileHandle* fh4 = [aDecoder decodeObjectOfClass: [NSFileHandle class] forKey: @"socket4FD"];
+        socket4FD = fh4 ? fh4.fileDescriptor : SOCKET_NULL;
+
+        NSFileHandle* fh6 = [aDecoder decodeObjectOfClass: [NSFileHandle class] forKey: @"socket6FD"];
+        socket6FD = fh6 ? fh6.fileDescriptor : SOCKET_NULL;
+        
+        
+        connectInterface4 = [aDecoder decodeObjectOfClass: [NSData class] forKey: @"connectInterface4"];
+        connectInterface6 = [aDecoder decodeObjectOfClass: [NSData class] forKey: @"connectInterface6"];
+        
+        IsOnSocketQueueOrTargetQueueKey = &IsOnSocketQueueOrTargetQueueKey;
+        socketQueue = dispatch_queue_create([GCDAsyncSocketQueueName UTF8String], NULL);
+        void *nonNullUnusedPointer = (__bridge void *)self;
+        dispatch_queue_set_specific(socketQueue, IsOnSocketQueueOrTargetQueueKey, nonNullUnusedPointer, NULL);
+        
+        readQueue = [[NSMutableArray alloc] initWithCapacity:5];
+        currentRead = nil;
+        
+        writeQueue = [[NSMutableArray alloc] initWithCapacity:5];
+        currentWrite = nil;
+        
+        preBuffer = [[GCDAsyncSocketPreBuffer alloc] initWithCapacity:(1024 * 4)];
+    }
+//    
+    return self;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1454,10 +1532,28 @@ enum GCDAsyncSocketConfig
 	return [self acceptOnInterface:nil port:port error:errPtr];
 }
 
-- (BOOL)acceptOnInterface:(NSString *)inInterface port:(uint16_t)port error:(NSError **)errPtr
+- (BOOL)acceptOnInterface:(NSString *)inInterface port:(uint16_t)inPort error:(NSError **)errPtr
 {
 	LogTrace();
-	
+
+    NSError* error = nil;
+    if (![self bindOnInterface: inInterface port: inPort error: &error])
+    {
+        *errPtr = error;
+        return NO;
+    }
+    
+    if (![self acceptOnBoundInterfaceError: &error])
+    {
+        *errPtr = error;
+        return NO;
+    }
+    return YES;
+}
+
+
+- (BOOL)bindOnInterface:(NSString *)inInterface port:(uint16_t)port error:(NSError **)errPtr
+{
 	// Just in-case interface parameter is immutable.
 	NSString *interface = [inInterface copy];
 	
@@ -1538,22 +1634,6 @@ enum GCDAsyncSocketConfig
 	// Create dispatch block and run on socketQueue
 	
 	dispatch_block_t block = ^{ @autoreleasepool {
-		
-		if (delegate == nil) // Must have delegate set
-		{
-			NSString *msg = @"Attempting to accept without a delegate. Set a delegate first.";
-			err = [self badConfigError:msg];
-			
-			return_from_block;
-		}
-		
-		if (delegateQueue == NULL) // Must have delegate queue set
-		{
-			NSString *msg = @"Attempting to accept without a delegate queue. Set a delegate queue first.";
-			err = [self badConfigError:msg];
-			
-			return_from_block;
-		}
 		
 		BOOL isIPv4Disabled = (config & kIPv4Disabled) ? YES : NO;
 		BOOL isIPv6Disabled = (config & kIPv6Disabled) ? YES : NO;
@@ -1654,7 +1734,52 @@ enum GCDAsyncSocketConfig
 		
 		// Create accept sources
 		
-		if (enableIPv4)
+		result = YES;
+	}};
+	
+	if (dispatch_get_specific(IsOnSocketQueueOrTargetQueueKey))
+		block();
+	else
+		dispatch_sync(socketQueue, block);
+	
+	if (result == NO)
+	{
+		LogInfo(@"Error in accept: %@", err);
+		
+		if (errPtr)
+			*errPtr = err;
+	}
+	
+	return result;
+}
+
+- (BOOL)acceptOnBoundInterfaceError:(NSError **)errPtr
+{
+    // Create dispatch block and run on socketQueue
+    __block BOOL result = NO;
+	__block NSError *err = nil;
+
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		if (delegate == nil) // Must have delegate set
+		{
+			NSString *msg = @"Attempting to accept without a delegate. Set a delegate first.";
+			err = [self badConfigError:msg];
+			
+			return_from_block;
+		}
+		
+		if (delegateQueue == NULL) // Must have delegate queue set
+		{
+			NSString *msg = @"Attempting to accept without a delegate queue. Set a delegate queue first.";
+			err = [self badConfigError:msg];
+			
+			return_from_block;
+		}
+				
+		// Create accept sources
+		
+		if (socket4FD != SOCKET_NULL)
 		{
 			accept4Source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, socket4FD, 0, socketQueue);
 			
@@ -1675,10 +1800,10 @@ enum GCDAsyncSocketConfig
 			
 			dispatch_source_set_cancel_handler(accept4Source, ^{
 				
-				#if NEEDS_DISPATCH_RETAIN_RELEASE
+#if NEEDS_DISPATCH_RETAIN_RELEASE
 				LogVerbose(@"dispatch_release(accept4Source)");
 				dispatch_release(acceptSource);
-				#endif
+#endif
 				
 				LogVerbose(@"close(socket4FD)");
 				close(socketFD);
@@ -1688,7 +1813,7 @@ enum GCDAsyncSocketConfig
 			dispatch_resume(accept4Source);
 		}
 		
-		if (enableIPv6)
+		if (socket6FD != SOCKET_NULL)
 		{
 			accept6Source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, socket6FD, 0, socketQueue);
 			
@@ -1709,10 +1834,10 @@ enum GCDAsyncSocketConfig
 			
 			dispatch_source_set_cancel_handler(accept6Source, ^{
 				
-				#if NEEDS_DISPATCH_RETAIN_RELEASE
+#if NEEDS_DISPATCH_RETAIN_RELEASE
 				LogVerbose(@"dispatch_release(accept6Source)");
 				dispatch_release(acceptSource);
-				#endif
+#endif
 				
 				LogVerbose(@"close(socket6FD)");
 				close(socketFD);
@@ -1742,6 +1867,7 @@ enum GCDAsyncSocketConfig
 	
 	return result;
 }
+
 
 - (BOOL)doAccept:(int)parentSocketFD
 {
@@ -1857,6 +1983,8 @@ enum GCDAsyncSocketConfig
 	
 	return YES;
 }
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Connecting
@@ -2282,7 +2410,7 @@ enum GCDAsyncSocketConfig
 	{
 		NSString *msg = @"IPv4 has been disabled and DNS lookup found no IPv6 address.";
 		
-		[self closeWithError:[self otherError:msg]];
+		[self closeForDealloc: NO withError:[self otherError:msg]];
 		return;
 	}
 	
@@ -2290,7 +2418,7 @@ enum GCDAsyncSocketConfig
 	{
 		NSString *msg = @"IPv6 has been disabled and DNS lookup found no IPv4 address.";
 		
-		[self closeWithError:[self otherError:msg]];
+		[self closeForDealloc: NO withError:[self otherError:msg]];
 		return;
 	}
 	
@@ -2299,7 +2427,7 @@ enum GCDAsyncSocketConfig
 	NSError *err = nil;
 	if (![self connectWithAddress4:address4 address6:address6 error:&err])
 	{
-		[self closeWithError:err];
+		[self closeForDealloc: NO withError:err];
 	}
 }
 
@@ -2328,7 +2456,7 @@ enum GCDAsyncSocketConfig
 	}
 	
 	[self endConnectTimeout];
-	[self closeWithError:error];
+	[self closeForDealloc: NO withError:error];
 }
 
 - (BOOL)connectWithAddress4:(NSData *)address4 address6:(NSData *)address6 error:(NSError **)errPtr
@@ -2483,13 +2611,13 @@ enum GCDAsyncSocketConfig
 		
 		if (![self createReadAndWriteStream])
 		{
-			[self closeWithError:[self otherError:@"Error creating CFStreams"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error creating CFStreams"]];
 			return;
 		}
 		
 		if (![self registerForStreamCallbacksIncludingReadWrite:NO])
 		{
-			[self closeWithError:[self otherError:@"Error in CFStreamSetClient"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamSetClient"]];
 			return;
 		}
 		
@@ -2506,13 +2634,13 @@ enum GCDAsyncSocketConfig
 		
 		if (![self addStreamsToRunLoop])
 		{
-			[self closeWithError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
 			return;
 		}
 		
 		if (![self openStreams])
 		{
-			[self closeWithError:[self otherError:@"Error creating CFStreams"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error creating CFStreams"]];
 			return;
 		}
 		
@@ -2556,7 +2684,7 @@ enum GCDAsyncSocketConfig
 	if (result == -1)
 	{
 		NSString *errMsg = @"Error enabling non-blocking IO on socket (fcntl)";
-		[self closeWithError:[self otherError:errMsg]];
+		[self closeForDealloc: NO withError:[self otherError:errMsg]];
 		
 		return;
 	}
@@ -2587,7 +2715,7 @@ enum GCDAsyncSocketConfig
 		return;
 	}
 	
-	[self closeWithError:error];
+	[self closeForDealloc: NO withError:error];
 }
 
 - (void)startConnectTimeout:(NSTimeInterval)timeout
@@ -2649,14 +2777,14 @@ enum GCDAsyncSocketConfig
 	LogTrace();
 	
 	[self endConnectTimeout];
-	[self closeWithError:[self connectTimeoutError]];
+	[self closeForDealloc: NO withError:[self connectTimeoutError]];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Disconnecting
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-- (void)closeWithError:(NSError *)error
+- (void)closeForDealloc: (BOOL)forDealloc withError:(NSError *)error
 {
 	LogTrace();
 	
@@ -2724,23 +2852,23 @@ enum GCDAsyncSocketConfig
 	// So we have to unpause the source if needed.
 	// This allows the cancel handler to be run, which in turn releases the source and closes the socket.
 	
-	if (!accept4Source && !accept6Source && !readSource && !writeSource)
+	if (!accept4Source && !accept6Source && !readSource && !writeSource && (!forDealloc || !(config & kDoNotCloseOnDealloc)))
 	{
-		LogVerbose(@"manually closing close");
+        LogVerbose(@"manually closing close");
 
-		if (socket4FD != SOCKET_NULL)
-		{
-			LogVerbose(@"close(socket4FD)");
-			close(socket4FD);
-			socket4FD = SOCKET_NULL;
-		}
+        if (socket4FD != SOCKET_NULL)
+        {
+            LogVerbose(@"close(socket4FD)");
+            close(socket4FD);
+            socket4FD = SOCKET_NULL;
+        }
 
-		if (socket6FD != SOCKET_NULL)
-		{
-			LogVerbose(@"close(socket6FD)");
-			close(socket6FD);
-			socket6FD = SOCKET_NULL;
-		}
+        if (socket6FD != SOCKET_NULL)
+        {
+            LogVerbose(@"close(socket6FD)");
+            close(socket6FD);
+            socket6FD = SOCKET_NULL;
+        }
 	}
 	else
 	{
@@ -2818,7 +2946,7 @@ enum GCDAsyncSocketConfig
 		
 		if (flags & kSocketStarted)
 		{
-			[self closeWithError:nil];
+			[self closeForDealloc: NO withError:nil];
 		}
 	}};
 	
@@ -2904,7 +3032,7 @@ enum GCDAsyncSocketConfig
 	
 	if (shouldClose)
 	{
-		[self closeWithError:nil];
+		[self closeForDealloc: NO withError:nil];
 	}
 }
 
@@ -4044,12 +4172,12 @@ enum GCDAsyncSocketConfig
 			{
 				if (([writeQueue count] == 0) && (currentWrite == nil))
 				{
-					[self closeWithError:nil];
+					[self closeForDealloc: NO withError:nil];
 				}
 			}
 			else
 			{
-				[self closeWithError:nil];
+				[self closeForDealloc: NO withError:nil];
 			}
 		}
 		else if (flags & kSocketSecure)
@@ -4875,7 +5003,7 @@ enum GCDAsyncSocketConfig
 	
 	if (error)
 	{
-		[self closeWithError:error];
+		[self closeForDealloc: NO withError:error];
 	}
 	else if (socketEOF)
 	{
@@ -5017,7 +5145,7 @@ enum GCDAsyncSocketConfig
 				error = [self connectionClosedError];
 			}
 		}
-		[self closeWithError:error];
+		[self closeForDealloc: NO withError:error];
 	}
 	else
 	{
@@ -5173,7 +5301,7 @@ enum GCDAsyncSocketConfig
 		{
 			LogVerbose(@"ReadTimeout");
 			
-			[self closeWithError:[self readTimeoutError]];
+			[self closeForDealloc: NO withError:[self readTimeoutError]];
 		}
 	}
 }
@@ -5293,12 +5421,12 @@ enum GCDAsyncSocketConfig
 			{
 				if (([readQueue count] == 0) && (currentRead == nil))
 				{
-					[self closeWithError:nil];
+					[self closeForDealloc: NO withError:nil];
 				}
 			}
 			else
 			{
-				[self closeWithError:nil];
+				[self closeForDealloc: NO withError:nil];
 			}
 		}
 	}
@@ -5685,7 +5813,7 @@ enum GCDAsyncSocketConfig
 	
 	if (error)
 	{
-		[self closeWithError:[self errnoErrorWithReason:@"Error in write() function"]];
+		[self closeForDealloc: NO withError:[self errnoErrorWithReason:@"Error in write() function"]];
 	}
 	
 	// Do not add any code here without first adding a return statement in the error case above.
@@ -5803,7 +5931,7 @@ enum GCDAsyncSocketConfig
 		{
 			LogVerbose(@"WriteTimeout");
 			
-			[self closeWithError:[self writeTimeoutError]];
+			[self closeForDealloc: NO withError:[self writeTimeoutError]];
 		}
 	}
 }
@@ -6166,7 +6294,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		
 		if (sslContext == NULL)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLCreateContext"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLCreateContext"]];
 			return;
 		}
 	}
@@ -6175,7 +6303,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLNewContext(isServer, &sslContext);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLNewContext"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLNewContext"]];
 			return;
 		}
 	}
@@ -6184,14 +6312,14 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	status = SSLSetIOFuncs(sslContext, &SSLReadFunction, &SSLWriteFunction);
 	if (status != noErr)
 	{
-		[self closeWithError:[self otherError:@"Error in SSLSetIOFuncs"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetIOFuncs"]];
 		return;
 	}
 	
 	status = SSLSetConnection(sslContext, (__bridge SSLConnectionRef)self);
 	if (status != noErr)
 	{
-		[self closeWithError:[self otherError:@"Error in SSLSetConnection"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetConnection"]];
 		return;
 	}
 	
@@ -6223,7 +6351,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetPeerDomainName(sslContext, peer, peerLen);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetPeerDomainName"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetPeerDomainName"]];
 			return;
 		}
 	}
@@ -6242,7 +6370,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetAllowsAnyRoot(sslContext, allowsAnyRoot);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetAllowsAnyRoot"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetAllowsAnyRoot"]];
 			return;
 		}
 		
@@ -6263,7 +6391,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetAllowsExpiredRoots(sslContext, allowsExpiredRoots);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetAllowsExpiredRoots"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetAllowsExpiredRoots"]];
 			return;
 		}
 		
@@ -6284,7 +6412,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetEnableCertVerify(sslContext, validatesCertChain);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetEnableCertVerify"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetEnableCertVerify"]];
 			return;
 		}
 		
@@ -6305,7 +6433,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetAllowsExpiredCerts(sslContext, allowsExpiredCerts);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetAllowsExpiredCerts"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetAllowsExpiredCerts"]];
 			return;
 		}
 		
@@ -6322,7 +6450,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetCertificate(sslContext, certs);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetCertificate"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetCertificate"]];
 			return;
 		}
 	}
@@ -6389,7 +6517,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 			
 			if (status1 != noErr || status2 != noErr)
 			{
-				[self closeWithError:[self otherError:@"Error in SSLSetProtocolVersionMinMax"]];
+				[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetProtocolVersionMinMax"]];
 				return;
 			}
 		}
@@ -6445,7 +6573,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 			
 			if (status1 != noErr || status2 != noErr || status3 != noErr)
 			{
-				[self closeWithError:[self otherError:@"Error in SSLSetProtocolVersionEnabled"]];
+				[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetProtocolVersionEnabled"]];
 				return;
 			}
 		}
@@ -6471,7 +6599,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetEnabledCiphers(sslContext, ciphers, numberCiphers);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetEnabledCiphers"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetEnabledCiphers"]];
 			return;
 		}
 	}
@@ -6487,7 +6615,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		status = SSLSetDiffieHellmanParams(sslContext, [diffieHellmanData bytes], [diffieHellmanData length]);
 		if (status != noErr)
 		{
-			[self closeWithError:[self otherError:@"Error in SSLSetDiffieHellmanParams"]];
+			[self closeForDealloc: NO withError:[self otherError:@"Error in SSLSetDiffieHellmanParams"]];
 			return;
 		}
 	}
@@ -6563,7 +6691,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	}
 	else
 	{
-		[self closeWithError:[self sslError:status]];
+		[self closeForDealloc: NO withError:[self sslError:status]];
 	}
 }
 
@@ -6613,7 +6741,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 		flags &= ~kStartingReadTLS;
 		flags &= ~kStartingWriteTLS;
 		
-		[self closeWithError:error];
+		[self closeForDealloc: NO withError:error];
 	}
 }
 
@@ -6627,7 +6755,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	{
 		NSString *msg = @"Invalid TLS transition. Handshake has already been read from socket.";
 		
-		[self closeWithError:[self otherError:msg]];
+		[self closeForDealloc: NO withError:[self otherError:msg]];
 		return;
 	}
 	
@@ -6642,19 +6770,19 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	if (![self createReadAndWriteStream])
 	{
-		[self closeWithError:[self otherError:@"Error in CFStreamCreatePairWithSocket"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamCreatePairWithSocket"]];
 		return;
 	}
 	
 	if (![self registerForStreamCallbacksIncludingReadWrite:YES])
 	{
-		[self closeWithError:[self otherError:@"Error in CFStreamSetClient"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamSetClient"]];
 		return;
 	}
 	
 	if (![self addStreamsToRunLoop])
 	{
-		[self closeWithError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamScheduleWithRunLoop"]];
 		return;
 	}
 	
@@ -6691,13 +6819,13 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 	
 	if (!r1 && !r2) // Yes, the && is correct - workaround for apple bug.
 	{
-		[self closeWithError:[self otherError:@"Error in CFStreamSetProperty"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamSetProperty"]];
 		return;
 	}
 	
 	if (![self openStreams])
 	{
-		[self closeWithError:[self otherError:@"Error in CFStreamOpen"]];
+		[self closeForDealloc: NO withError:[self otherError:@"Error in CFStreamOpen"]];
 		return;
 	}
 	
@@ -6828,7 +6956,7 @@ static void CFReadStreamCallback (CFReadStreamRef stream, CFStreamEventType type
 				}
 				else
 				{
-					[asyncSocket closeWithError:error];
+					[asyncSocket closeForDealloc: NO withError:error];
 				}
 			}});
 			
@@ -6895,7 +7023,7 @@ static void CFWriteStreamCallback (CFWriteStreamRef stream, CFStreamEventType ty
 				}
 				else
 				{
-					[asyncSocket closeWithError:error];
+					[asyncSocket closeForDealloc: NO withError:error];
 				}
 			}});
 			

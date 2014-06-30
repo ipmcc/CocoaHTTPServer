@@ -410,7 +410,7 @@ static const int httpLogLevel = HTTP_LOG_LEVEL_INFO; // | HTTP_LOG_FLAG_TRACE;
 	
 	dispatch_sync(serverQueue, ^{ @autoreleasepool {
 		
-		success = [asyncSocket acceptOnInterface:interface port:port error:&err];
+		success = [asyncSocket acceptOnBoundInterfaceError: &err];
 		if (success)
 		{
 			HTTPLogInfo(@"%@: Started HTTP server on port %hu", THIS_FILE, [asyncSocket localPort]);

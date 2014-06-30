@@ -93,7 +93,7 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
 #pragma mark -
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-@interface GCDAsyncSocket : NSObject
+@interface GCDAsyncSocket : NSObject <NSSecureCoding>
 
 /**
  * GCDAsyncSocket uses the standard delegate paradigm,
@@ -186,6 +186,10 @@ typedef enum GCDAsyncSocketError GCDAsyncSocketError;
  * To accept connections on any interface pass nil, or simply use the acceptOnPort:error: method.
 **/
 - (BOOL)acceptOnInterface:(NSString *)interface port:(uint16_t)port error:(NSError **)errPtr;
+
+- (BOOL)bindOnInterface:(NSString *)interface port:(uint16_t)port error:(NSError **)errPtr;
+
+- (BOOL)acceptOnBoundInterfaceError:(NSError **)errPtr;
 
 #pragma mark Connecting
 
